@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.kafka.common.serialization.Serde;
 import org.apache.kafka.common.serialization.Serdes;
 import org.apache.kafka.common.utils.Bytes;
+import org.apache.kafka.streams.KeyValue;
 import org.apache.kafka.streams.StreamsBuilder;
 import org.apache.kafka.streams.kstream.*;
 import org.apache.kafka.streams.state.KeyValueStore;
@@ -43,42 +44,56 @@ public class TopologyConfig {
                         .withKeySerde(Serdes.String())
                         .withValueSerde(userStockSerde()));
 
-        // 2) execution: GlobalKTable (key = stockId, value = raw json string)
-        GlobalKTable<String, String> executionGT = builder.globalTable(
-                executionTopic,
-                Consumed.with(Serdes.String(), Serdes.String()).withName("execution-consumed"),
-                Materialized.<String, String, KeyValueStore<Bytes, byte[]>>as("execution-raw")
+        // 2) execution: KTable (key = userId|stockId, value = ExecutionRow)
+        KTable<String, ExecutionRow> executionTable = builder
+                .stream(executionTopic, Consumed.with(Serdes.String(), Serdes.String()))
+                .mapValues(DebeziumParser::parseExecution)
+                .filter((k,v) -> v != null)
+                .selectKey((k,v) -> v.getUserId() + "|" + v.getStockId())
+                .toTable(Materialized.<String, ExecutionRow, KeyValueStore<Bytes, byte[]>>as("execution-table")
                         .withKeySerde(Serdes.String())
-                        .withValueSerde(Serdes.String())
+                        .withValueSerde(executionSerde()));
+
+        // 3) KTable-KTable 조인: userstock과 execution을 userId|stockId로 조인
+        KTable<String, PortfolioAgg> positions = userStock.leftJoin(
+                executionTable,
+                // 조인 결과: row(UserStockRow) + exec(ExecutionRow)
+                (row, exec) -> {
+                    double currentPrice = (exec == null) ? row.getAvgPrice() : exec.getPrice();
+                    double invested = row.getAvgPrice() * row.getHoldingQuantity();
+                    double current  = currentPrice        * row.getHoldingQuantity();
+                    
+                    // 디버깅 로그
+                    System.out.println("DEBUG: userId=" + row.getUserId() + 
+                                      ", stockId=" + row.getStockId() + 
+                                      ", avgPrice=" + row.getAvgPrice() + 
+                                      ", currentPrice=" + currentPrice + 
+                                      ", holdingQuantity=" + row.getHoldingQuantity() + 
+                                      ", invested=" + invested + 
+                                      ", current=" + current +
+                                      ", profitRate=" + ((current - invested) / invested * 100.0));
+                    
+                    return new PortfolioAgg(invested, current);
+                }
         );
 
-        // 3) 외래키 조인: userstock(row)에서 stockId 추출 → GlobalKTable lookup
-        KStream<String, PortfolioAgg> userPositions = userStock
-                .toStream() // key = userId|stockId
-                .leftJoin(
-                        executionGT,
-                        // 외래키: userId|stockId → stockId
-                        (userIdStockId, row) -> row.getStockId(),
-                        // 조인 결과: row(UserStockRow) + execJson(String)
-                        (row, execJson) -> {
-                            ExecutionRow exec = DebeziumParser.parseExecution(execJson);
-                            double currentPrice = (exec == null) ? row.getAvgPrice() : exec.getPrice();
-                            double invested = row.getAvgPrice() * row.getHoldingQuantity();
-                            double current  = currentPrice        * row.getHoldingQuantity();
-                            return new PortfolioAgg(invested, current);
-                        }
-                )
-                // key = userId
-                .selectKey((userIdStockId, agg) -> userIdStockId.split("\\|", 2)[0]);
-
-        // 4) 사용자별 합산 (간단 reduce) — 소규모 트래픽 전제
+        // 4) userId 단위로 합산 (KTable.reduce: add / subtract 둘 다 필요)
         Serde<PortfolioAgg> aggSerde = portfolioSerde();
-        KTable<String, PortfolioAgg> userAgg = userPositions
-                .groupByKey(Grouped.with(Serdes.String(), aggSerde))
+        KTable<String, PortfolioAgg> userAgg = positions
+                .groupBy(
+                        (userIdStockId, agg) -> KeyValue.pair(userIdStockId.split("\\|", 2)[0], agg),
+                        Grouped.with(Serdes.String(), aggSerde)
+                )
                 .reduce(
+                        // add
                         (oldV, newV) -> new PortfolioAgg(
                                 (oldV==null?0:oldV.getInvested()) + newV.getInvested(),
                                 (oldV==null?0:oldV.getCurrent())  + newV.getCurrent()
+                        ),
+                        // subtract (해당 키의 이전값이 빠질 때 역연산)
+                        (oldV, newV) -> new PortfolioAgg(
+                                (oldV==null?0:oldV.getInvested()) - newV.getInvested(),
+                                (oldV==null?0:oldV.getCurrent())  - newV.getCurrent()
                         ),
                         Materialized.<String, PortfolioAgg, KeyValueStore<Bytes, byte[]>>as("user-agg-store")
                                 .withKeySerde(Serdes.String())
@@ -149,6 +164,24 @@ public class TopologyConfig {
                 if (bytes == null) return null;
                 String[] p = new String(bytes, StandardCharsets.UTF_8).split(",");
                 return new PortfolioAgg(Double.parseDouble(p[0]), Double.parseDouble(p[1]));
+            }
+        };
+        return Serdes.serdeFrom(ser, de);
+    }
+
+    private Serde<ExecutionRow> executionSerde() {
+        var ser = new org.apache.kafka.common.serialization.Serializer<ExecutionRow>() {
+            @Override public byte[] serialize(String topic, ExecutionRow d) {
+                if (d == null) return null;
+                String s = d.getUserId() + "," + d.getStockId() + "," + d.getPrice();
+                return s.getBytes(StandardCharsets.UTF_8);
+            }
+        };
+        var de = new org.apache.kafka.common.serialization.Deserializer<ExecutionRow>() {
+            @Override public ExecutionRow deserialize(String topic, byte[] bytes) {
+                if (bytes == null) return null;
+                String[] p = new String(bytes, StandardCharsets.UTF_8).split(",");
+                return new ExecutionRow(Long.parseLong(p[0]), p[1], Double.parseDouble(p[2]));
             }
         };
         return Serdes.serdeFrom(ser, de);
