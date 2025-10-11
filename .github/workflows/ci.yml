@@ -16,7 +16,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  BOOT_VERSION: "3.5.5"
+  BOOT_VERSION: "3.5.6"
   IMAGE_NAME: "ranking-stream"
 
 jobs:
@@ -46,19 +46,19 @@ jobs:
           java-version: '17'
           cache: maven
 
-      # --- Spring Boot 3.5.5 일관성 확인(원하면 유지, 아니면 이 스텝 제거) ---
+      # --- Spring Boot 3.5.6 일관성 확인 ---
       - name: Enforce Spring Boot ${{ env.BOOT_VERSION }}
         shell: bash
         run: |
           FAILS=()
           for f in $(git ls-files '**/build.gradle' '**/build.gradle.kts' '**/settings.gradle' '**/settings.gradle.kts'); do
             if grep -q "org.springframework.boot" "$f"; then
-              grep -Eq "3\.5\.5" "$f" || FAILS+=("$f")
+              grep -Eq "3\.5\.6" "$f" || FAILS+=("$f")
             fi
           done
           for p in $(git ls-files '**/pom.xml'); do
             if grep -q "spring-boot" "$p"; then
-              grep -q "3.5.5" "$p" || FAILS+=("$p")
+              grep -q "3.5.6" "$p" || FAILS+=("$p")
             fi
           done
           if [ ${#FAILS[@]} -gt 0 ]; then
