@@ -23,9 +23,10 @@ public final class DebeziumParser {
         try {
             JsonNode after = M.readTree(v).path("payload").path("after");
             if (after.isMissingNode() || after.isNull()) return null;
+            long userId = after.path("userId").asLong();
             String stockId = after.path("stockId").asText();
             double price = after.path("price").asDouble();
-            return new ExecutionRow(stockId, price);
+            return new ExecutionRow(userId, stockId, price);
         } catch (Exception e) { return null; }
     }
 }
