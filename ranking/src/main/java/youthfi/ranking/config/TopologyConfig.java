@@ -3,8 +3,10 @@ package youthfi.ranking.config;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.kafka.common.serialization.Serde;
 import org.apache.kafka.common.serialization.Serdes;
+import org.apache.kafka.common.utils.Bytes;
 import org.apache.kafka.streams.StreamsBuilder;
 import org.apache.kafka.streams.kstream.*;
+import org.apache.kafka.streams.state.KeyValueStore;
 import org.apache.kafka.streams.state.Stores;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
@@ -37,13 +39,17 @@ public class TopologyConfig {
                 .mapValues(DebeziumParser::parseUserStock)
                 .filter((k,v) -> v != null)
                 .selectKey((k,v) -> v.getUserId() + "|" + v.getStockId())
-                .toTable(Materialized.as("userstock-table"));
+                .toTable(Materialized.<String, UserStockRow, KeyValueStore<Bytes, byte[]>>as("userstock-table")
+                        .withKeySerde(Serdes.String())
+                        .withValueSerde(userStockSerde()));
 
         // 2) execution: GlobalKTable (key = stockId, value = raw json string)
         GlobalKTable<String, String> executionGT = builder.globalTable(
                 executionTopic,
-                Consumed.with(Serdes.String(), Serdes.String()),
-                Materialized.with(Serdes.String(), Serdes.String())
+                Consumed.with(Serdes.String(), Serdes.String()).withName("execution-consumed"),
+                Materialized.<String, String, KeyValueStore<Bytes, byte[]>>as("execution-raw")
+                        .withKeySerde(Serdes.String())
+                        .withValueSerde(Serdes.String())
         );
 
         // 3) 외래키 조인: userstock(row)에서 stockId 추출 → GlobalKTable lookup
@@ -74,7 +80,9 @@ public class TopologyConfig {
                                 (oldV==null?0:oldV.getInvested()) + newV.getInvested(),
                                 (oldV==null?0:oldV.getCurrent())  + newV.getCurrent()
                         ),
-                        Materialized.with(Serdes.String(), aggSerde)
+                        Materialized.<String, PortfolioAgg, KeyValueStore<Bytes, byte[]>>as("user-agg-store")
+                                .withKeySerde(Serdes.String())
+                                .withValueSerde(aggSerde)
                 );
 
         // 5) 수익률 계산 스트림
@@ -104,6 +112,30 @@ public class TopologyConfig {
     }
 
     // ---- Serde helpers (Lombok 클래스 기준: getter 사용) ----
+    private Serde<UserStockRow> userStockSerde() {
+        var ser = new org.apache.kafka.common.serialization.Serializer<UserStockRow>() {
+            @Override public byte[] serialize(String topic, UserStockRow d) {
+                if (d == null) return null;
+                try {
+                    return M.writeValueAsBytes(d);
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            }
+        };
+        var de = new org.apache.kafka.common.serialization.Deserializer<UserStockRow>() {
+            @Override public UserStockRow deserialize(String topic, byte[] bytes) {
+                if (bytes == null) return null;
+                try {
+                    return M.readValue(bytes, UserStockRow.class);
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            }
+        };
+        return Serdes.serdeFrom(ser, de);
+    }
+
     private Serde<PortfolioAgg> portfolioSerde() {
         var ser = new org.apache.kafka.common.serialization.Serializer<PortfolioAgg>() {
             @Override public byte[] serialize(String topic, PortfolioAgg d) {
