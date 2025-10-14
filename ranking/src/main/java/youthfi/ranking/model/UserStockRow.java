@@ -7,7 +7,7 @@ import lombok.Setter;
 
 @Getter @Setter @NoArgsConstructor @AllArgsConstructor
 public class UserStockRow {
-    private long userId;
+    private String userId;
     private String stockId;
     private int holdingQuantity;
     private double avgPrice;

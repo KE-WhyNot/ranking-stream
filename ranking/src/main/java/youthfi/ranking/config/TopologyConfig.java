@@ -181,7 +181,7 @@ public class TopologyConfig {
             @Override public ExecutionRow deserialize(String topic, byte[] bytes) {
                 if (bytes == null) return null;
                 String[] p = new String(bytes, StandardCharsets.UTF_8).split(",");
-                return new ExecutionRow(Long.parseLong(p[0]), p[1], Double.parseDouble(p[2]));
+                return new ExecutionRow(p[0], p[1], Double.parseDouble(p[2]));
             }
         };
         return Serdes.serdeFrom(ser, de);
