@@ -40,7 +40,7 @@ public class TopNTransformer implements ValueTransformerWithKey<String, Double, 
             KeyValue<String, Double> e = all.get(i);
             RankItem item = new RankItem();
             item.setUserId(e.key);
-            item.setRank(i + 1);
+            item.setRankNo(i + 1);
             item.setProfitRate(e.value);
             top10.add(item);
         }
