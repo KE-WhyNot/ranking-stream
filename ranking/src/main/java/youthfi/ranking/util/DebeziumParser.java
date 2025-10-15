@@ -11,10 +11,10 @@ public final class DebeziumParser {
         try {
             JsonNode after = M.readTree(v).path("payload").path("after");
             if (after.isMissingNode() || after.isNull()) return null;
-            String userId = after.path("userId").asText();
-            String stockId = after.path("stockId").asText();
-            int qty = after.path("holdingQuantity").asInt();
-            double avg = after.path("avgPrice").asDouble();
+            String userId = after.path("user_id").asText();
+            String stockId = after.path("stock_id").asText();
+            int qty = after.path("holding_quantity").asInt();
+            double avg = after.path("avg_price").asDouble();
             return new UserStockRow(userId, stockId, qty, avg);
         } catch (Exception e) { return null; }
     }
@@ -23,8 +23,8 @@ public final class DebeziumParser {
         try {
             JsonNode after = M.readTree(v).path("payload").path("after");
             if (after.isMissingNode() || after.isNull()) return null;
-            String userId = after.path("userId").asText();
-            String stockId = after.path("stockId").asText();
+            String userId = after.path("user_id").asText();
+            String stockId = after.path("stock_id").asText();
             double price = after.path("price").asDouble();
             return new ExecutionRow(userId, stockId, price);
         } catch (Exception e) { return null; }
