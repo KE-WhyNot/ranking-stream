@@ -4,11 +4,8 @@ import youthfi.ranking.model.ExecutionRow;
 import youthfi.ranking.model.UserStockRow;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.PropertyNamingStrategies;
-
 public final class DebeziumParser {
-    private static final ObjectMapper M = new ObjectMapper()
-            .setPropertyNamingStrategy(PropertyNamingStrategies.SNAKE_CASE);
+    private static final ObjectMapper M = new ObjectMapper();
 
     public static UserStockRow parseUserStock(String v){
         try {
