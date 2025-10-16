@@ -1,6 +1,7 @@
 package youthfi.ranking.config;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.PropertyNamingStrategies;
 import org.apache.kafka.common.serialization.Serde;
 import org.apache.kafka.common.serialization.Serdes;
 import org.apache.kafka.common.utils.Bytes;
@@ -25,7 +26,8 @@ import java.util.List;
 @Configuration
 public class TopologyConfig {
 
-    private static final ObjectMapper M = new ObjectMapper();
+    private static final ObjectMapper M = new ObjectMapper()
+            .setPropertyNamingStrategy(PropertyNamingStrategies.SNAKE_CASE);
 
     @Value("${topics.userstock}") String userStockTopic;
     @Value("${topics.execution}") String executionTopic;
@@ -54,30 +56,18 @@ public class TopologyConfig {
                         .withKeySerde(Serdes.String())
                         .withValueSerde(executionSerde()));
 
-        // 3) KTable-KTable 조인: userstock과 execution을 userId|stockId로 조인
+        // 3) 종목 단위 포지션 합성
         KTable<String, PortfolioAgg> positions = userStock.leftJoin(
                 executionTable,
-                // 조인 결과: row(UserStockRow) + exec(ExecutionRow)
                 (row, exec) -> {
                     double currentPrice = (exec == null) ? row.getAvgPrice() : exec.getPrice();
                     double invested = row.getAvgPrice() * row.getHoldingQuantity();
                     double current  = currentPrice        * row.getHoldingQuantity();
-                    
-                    // 디버깅 로그
-                    System.out.println("DEBUG: userId=" + row.getUserId() + 
-                                      ", stockId=" + row.getStockId() + 
-                                      ", avgPrice=" + row.getAvgPrice() + 
-                                      ", currentPrice=" + currentPrice + 
-                                      ", holdingQuantity=" + row.getHoldingQuantity() + 
-                                      ", invested=" + invested + 
-                                      ", current=" + current +
-                                      ", profitRate=" + ((current - invested) / invested * 100.0));
-                    
                     return new PortfolioAgg(invested, current);
                 }
         );
 
-        // 4) userId 단위로 합산 (KTable.reduce: add / subtract 둘 다 필요)
+        // 4) 유저 단위 합산
         Serde<PortfolioAgg> aggSerde = portfolioSerde();
         KTable<String, PortfolioAgg> userAgg = positions
                 .groupBy(
@@ -90,7 +80,6 @@ public class TopologyConfig {
                                 (oldV==null?0:oldV.getInvested()) + newV.getInvested(),
                                 (oldV==null?0:oldV.getCurrent())  + newV.getCurrent()
                         ),
-                        // subtract (해당 키의 이전값이 빠질 때 역연산)
                         (oldV, newV) -> new PortfolioAgg(
                                 (oldV==null?0:oldV.getInvested()) - newV.getInvested(),
                                 (oldV==null?0:oldV.getCurrent())  - newV.getCurrent()
@@ -100,21 +89,53 @@ public class TopologyConfig {
                                 .withValueSerde(aggSerde)
                 );
 
-        // 5) 수익률 계산 스트림
+        // 5) 활동 유저 KTable: user_id별 보유수량 합 > 0
+        KTable<String, Integer> qtyByUser = userStock
+                .mapValues(UserStockRow::getHoldingQuantity)
+                .groupBy(
+                        (key, qty) -> KeyValue.pair(key.split("\\|", 2)[0], qty),
+                        Grouped.with(Serdes.String(), Serdes.Integer())
+                )
+                .reduce(
+                        (agg, nv) -> (agg==null?0:agg) + (nv==null?0:nv),
+                        (agg, ov) -> (agg==null?0:agg) - (ov==null?0:ov),
+                        Materialized.<String, Integer, KeyValueStore<Bytes, byte[]>>as("qty-by-user")
+                                .withKeySerde(Serdes.String())
+                                .withValueSerde(Serdes.Integer())
+                );
+
+        // sum(qty) > 0 인 유저만 유지 (null은 삭제)
+        KTable<String, String> activeUsers = qtyByUser
+                .mapValues(sum -> (sum != null && sum > 0) ? "1" : null)
+                .filter((u, flag) -> flag != null,
+                        Materialized.<String, String, KeyValueStore<Bytes, byte[]>>as("active-users")
+                                .withKeySerde(Serdes.String())
+                                .withValueSerde(Serdes.String())
+                );
+
+        // 6) 수익률 스트림 (0% 허용, NaN/Inf 방지)
         KStream<String, Double> userProfitRate = userAgg
                 .toStream()
-                .mapValues(PortfolioAgg::profitRatePct);
+                .mapValues(PortfolioAgg::profitRatePct) // invested<=0 => 0.0
+                .mapValues(r -> (r==null || Double.isNaN(r) || Double.isInfinite(r)) ? 0.0 : r);
 
-        // 6) Top10 계산 (StateStore)
+        // 7) 활동 유저와 INNER JOIN → 무보유/유령 제거
+        KStream<String, Double> filteredRate = userProfitRate.join(
+                activeUsers,
+                (rate, _flag) -> rate,
+                Joined.with(Serdes.String(), Serdes.Double(), Serdes.String())
+        );
+
+        // 8) Top10 계산 (tombstone 대응 Transformer)
         var storeBuilder = Stores.keyValueStoreBuilder(
                 Stores.persistentKeyValueStore("top10-store"),
                 Serdes.String(), Serdes.Double());
         builder.addStateStore(storeBuilder);
 
-        KStream<String, List<RankItem>> top10 = userProfitRate
+        KStream<String, List<RankItem>> top10 = filteredRate
                 .transformValues(() -> new TopNTransformer("top10-store"), "top10-store");
 
-        // 7) JSON 직렬화 후 단일 키로 발행 (예외 처리 포함)
+        // 9) snake_case JSON으로 발행
         top10
                 .mapValues(list -> {
                     try { return M.writeValueAsString(list); }
@@ -126,26 +147,20 @@ public class TopologyConfig {
         return builder.stream(outTopic, Consumed.with(Serdes.String(), Serdes.String()));
     }
 
-    // ---- Serde helpers (Lombok 클래스 기준: getter 사용) ----
+    // ---- Serde helpers ----
     private Serde<UserStockRow> userStockSerde() {
         var ser = new org.apache.kafka.common.serialization.Serializer<UserStockRow>() {
             @Override public byte[] serialize(String topic, UserStockRow d) {
                 if (d == null) return null;
-                try {
-                    return M.writeValueAsBytes(d);
-                } catch (Exception e) {
-                    throw new RuntimeException(e);
-                }
+                try { return M.writeValueAsBytes(d); }
+                catch (Exception e) { throw new RuntimeException(e); }
             }
         };
         var de = new org.apache.kafka.common.serialization.Deserializer<UserStockRow>() {
             @Override public UserStockRow deserialize(String topic, byte[] bytes) {
                 if (bytes == null) return null;
-                try {
-                    return M.readValue(bytes, UserStockRow.class);
-                } catch (Exception e) {
-                    throw new RuntimeException(e);
-                }
+                try { return M.readValue(bytes, UserStockRow.class); }
+                catch (Exception e) { throw new RuntimeException(e); }
             }
         };
         return Serdes.serdeFrom(ser, de);

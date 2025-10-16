@@ -23,22 +23,25 @@ public class TopNTransformer implements ValueTransformerWithKey<String, Double, 
 
     @Override
     public List<RankItem> transform(String userId, Double profitRate) {
-        if (userId == null || profitRate == null) return List.of();
-        store.put(userId, profitRate);
+        if (userId == null) return List.of();
+
+        if (profitRate == null) {
+            store.delete(userId);           // tombstone: 삭제
+        } else {
+            store.put(userId, profitRate);  // 0%도 정상 저장
+        }
 
         List<KeyValue<String, Double>> all = new ArrayList<>();
         try (KeyValueIterator<String, Double> it = store.all()) {
-            while (it.hasNext()) {
-                all.add(it.next()); // it.next() 는 KeyValue<String, Double>
-            }
+            while (it.hasNext()) all.add(it.next());
         }
 
         all.sort((a, b) -> Double.compare(b.value, a.value)); // 내림차순
 
         List<RankItem> top10 = new ArrayList<>();
         for (int i = 0; i < Math.min(10, all.size()); i++) {
-            KeyValue<String, Double> e = all.get(i);
-            RankItem item = new RankItem();
+            var e = all.get(i);
+            var item = new RankItem();
             item.setUserId(e.key);
             item.setRankNo(i + 1);
             item.setProfitRate(e.value);
