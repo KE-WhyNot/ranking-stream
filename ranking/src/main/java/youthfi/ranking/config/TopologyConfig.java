@@ -4,18 +4,15 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.kafka.common.serialization.Serde;
 import org.apache.kafka.common.serialization.Serdes;
 import org.apache.kafka.common.utils.Bytes;
-import org.apache.kafka.streams.KeyValue;
 import org.apache.kafka.streams.StreamsBuilder;
 import org.apache.kafka.streams.kstream.*;
-import org.apache.kafka.streams.state.KeyValueStore;
-import org.apache.kafka.streams.state.Stores;
+import org.apache.kafka.streams.state.*;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import youthfi.ranking.model.ExecutionRow;
-import youthfi.ranking.model.PortfolioAgg;
 import youthfi.ranking.model.RankItem;
-import youthfi.ranking.model.UserStockRow;
+import youthfi.ranking.transformer.RealizedRateFifoTransformer;
 import youthfi.ranking.transformer.TopNTransformer;
 import youthfi.ranking.util.DebeziumParser;
 
@@ -27,94 +24,53 @@ public class TopologyConfig {
 
     private static final ObjectMapper M = new ObjectMapper();
 
-    @Value("${topics.userstock}") String userStockTopic;
     @Value("${topics.execution}") String executionTopic;
     @Value("${topics.out}") String outTopic;
 
     @Bean
     public KStream<String, String> kStream(StreamsBuilder builder) {
 
-        // 1) userstock: KTable (key = userId|stockId)
-        KTable<String, UserStockRow> userStock = builder
-                .stream(userStockTopic, Consumed.with(Serdes.String(), Serdes.String()))
-                .mapValues(DebeziumParser::parseUserStock)
-                .filter((k,v) -> v != null)
-                .selectKey((k,v) -> v.getUserId() + "|" + v.getStockId())
-                .toTable(Materialized.<String, UserStockRow, KeyValueStore<Bytes, byte[]>>as("userstock-table")
-                        .withKeySerde(Serdes.String())
-                        .withValueSerde(userStockSerde()));
-
-        // 2) execution: KTable (key = userId|stockId, value = ExecutionRow)
-        KTable<String, ExecutionRow> executionTable = builder
+        // 0) execution 파싱 (키 = userId|stockId)
+        KStream<String, ExecutionRow> execStream = builder
                 .stream(executionTopic, Consumed.with(Serdes.String(), Serdes.String()))
                 .mapValues(DebeziumParser::parseExecution)
                 .filter((k,v) -> v != null)
-                .selectKey((k,v) -> v.getUserId() + "|" + v.getStockId())
-                .toTable(Materialized.<String, ExecutionRow, KeyValueStore<Bytes, byte[]>>as("execution-table")
-                        .withKeySerde(Serdes.String())
-                        .withValueSerde(executionSerde()));
+                .selectKey((k,v) -> v.getUserId() + "|" + v.getStockId());
 
-        // 3) KTable-KTable 조인: userstock과 execution을 userId|stockId로 조인
-        KTable<String, PortfolioAgg> positions = userStock.leftJoin(
-                executionTable,
-                // 조인 결과: row(UserStockRow) + exec(ExecutionRow)
-                (row, exec) -> {
-                    double currentPrice = (exec == null) ? row.getAvgPrice() : exec.getPrice();
-                    double invested = row.getAvgPrice() * row.getHoldingQuantity();
-                    double current  = currentPrice        * row.getHoldingQuantity();
+        // 1) BUY 롯 상태 스토어 (키=userId|stockId, 값=Deque<BuyLot> 직렬화 바이트)
+        var lotsStoreBuilder = Stores.keyValueStoreBuilder(
+                Stores.persistentKeyValueStore("buy-lots"),
+                Serdes.String(), Serdes.ByteArray());
+        builder.addStateStore(lotsStoreBuilder);
 
-                    // 디버깅 로그
-                    System.out.println("DEBUG: userId=" + row.getUserId() +
-                            ", stockId=" + row.getStockId() +
-                            ", avgPrice=" + row.getAvgPrice() +
-                            ", currentPrice=" + currentPrice +
-                            ", holdingQuantity=" + row.getHoldingQuantity() +
-                            ", invested=" + invested +
-                            ", current=" + current +
-                            ", profitRate=" + ((current - invested) / invested * 100.0));
+        // 2) FIFO 처리 → SELL 시 실현 수익률(Double) 방출
+        KStream<String, Double> realizedRatePerTrade =
+                execStream.transformValues(
+                        () -> new RealizedRateFifoTransformer("buy-lots"),
+                        "buy-lots"
+                ).filter((k,v) -> v != null);
 
-                    return new PortfolioAgg(invested, current);
-                }
-        );
-
-        // 4) userId 단위로 합산 (KTable.reduce: add / subtract 둘 다 필요)
-        Serde<PortfolioAgg> aggSerde = portfolioSerde();
-        KTable<String, PortfolioAgg> userAgg = positions
-                .groupBy(
-                        (userIdStockId, agg) -> KeyValue.pair(userIdStockId.split("\\|", 2)[0], agg),
-                        Grouped.with(Serdes.String(), aggSerde)
-                )
-                .reduce(
-                        // add
-                        (oldV, newV) -> new PortfolioAgg(
-                                (oldV==null?0:oldV.getInvested()) + newV.getInvested(),
-                                (oldV==null?0:oldV.getCurrent())  + newV.getCurrent()
-                        ),
-                        // subtract (해당 키의 이전값이 빠질 때 역연산)
-                        (oldV, newV) -> new PortfolioAgg(
-                                (oldV==null?0:oldV.getInvested()) - newV.getInvested(),
-                                (oldV==null?0:oldV.getCurrent())  - newV.getCurrent()
-                        ),
-                        Materialized.<String, PortfolioAgg, KeyValueStore<Bytes, byte[]>>as("user-agg-store")
+        // 3) 유저별 최신 실현 수익률 유지
+        KTable<String, Double> userLatestRate = realizedRatePerTrade
+                .selectKey((userStockKey, rate) -> userStockKey.split("\\|", 2)[0]) // userId
+                .groupByKey(Grouped.with(Serdes.String(), Serdes.Double()))
+                .reduce((oldV, newV) -> newV,
+                        Materialized.<String, Double, KeyValueStore<Bytes, byte[]>>as("user-latest-realized-rate")
                                 .withKeySerde(Serdes.String())
-                                .withValueSerde(aggSerde)
+                                .withValueSerde(Serdes.Double())
                 );
 
-        // 5) 수익률 계산 스트림
-        KStream<String, Double> userProfitRate = userAgg
-                .toStream()
-                .mapValues(PortfolioAgg::profitRatePct);
-
-        // 6) Top10 계산 (StateStore)
-        var storeBuilder = Stores.keyValueStoreBuilder(
+        // 4) Top10 계산 (StateStore)
+        var topStoreBuilder = Stores.keyValueStoreBuilder(
                 Stores.persistentKeyValueStore("top10-store"),
                 Serdes.String(), Serdes.Double());
-        builder.addStateStore(storeBuilder);
+        builder.addStateStore(topStoreBuilder);
 
-        KStream<String, List<RankItem>> top10 = userProfitRate
+        KStream<String, List<RankItem>> top10 = userLatestRate
+                .toStream()
                 .transformValues(() -> new TopNTransformer("top10-store"), "top10-store");
 
-        // 7) JSON 직렬화 후 단일 키로 발행 (예외 처리 포함)
+        // 5) JSON 직렬화 후 발행
         top10
                 .mapValues(list -> {
                     try { return M.writeValueAsString(list); }
@@ -126,54 +82,13 @@ public class TopologyConfig {
         return builder.stream(outTopic, Consumed.with(Serdes.String(), Serdes.String()));
     }
 
-    // ---- Serde helpers (Lombok 클래스 기준: getter 사용) ----
-    private Serde<UserStockRow> userStockSerde() {
-        var ser = new org.apache.kafka.common.serialization.Serializer<UserStockRow>() {
-            @Override public byte[] serialize(String topic, UserStockRow d) {
-                if (d == null) return null;
-                try {
-                    return M.writeValueAsBytes(d);
-                } catch (Exception e) {
-                    throw new RuntimeException(e);
-                }
-            }
-        };
-        var de = new org.apache.kafka.common.serialization.Deserializer<UserStockRow>() {
-            @Override public UserStockRow deserialize(String topic, byte[] bytes) {
-                if (bytes == null) return null;
-                try {
-                    return M.readValue(bytes, UserStockRow.class);
-                } catch (Exception e) {
-                    throw new RuntimeException(e);
-                }
-            }
-        };
-        return Serdes.serdeFrom(ser, de);
-    }
-
-    private Serde<PortfolioAgg> portfolioSerde() {
-        var ser = new org.apache.kafka.common.serialization.Serializer<PortfolioAgg>() {
-            @Override public byte[] serialize(String topic, PortfolioAgg d) {
-                if (d == null) return null;
-                String s = d.getInvested() + "," + d.getCurrent();
-                return s.getBytes(StandardCharsets.UTF_8);
-            }
-        };
-        var de = new org.apache.kafka.common.serialization.Deserializer<PortfolioAgg>() {
-            @Override public PortfolioAgg deserialize(String topic, byte[] bytes) {
-                if (bytes == null) return null;
-                String[] p = new String(bytes, StandardCharsets.UTF_8).split(",");
-                return new PortfolioAgg(Double.parseDouble(p[0]), Double.parseDouble(p[1]));
-            }
-        };
-        return Serdes.serdeFrom(ser, de);
-    }
-
+    // ---- Serde: ExecutionRow ----
     private Serde<ExecutionRow> executionSerde() {
         var ser = new org.apache.kafka.common.serialization.Serializer<ExecutionRow>() {
             @Override public byte[] serialize(String topic, ExecutionRow d) {
                 if (d == null) return null;
-                String s = d.getUserId() + "," + d.getStockId() + "," + d.getPrice();
+                String s = d.getUserId() + "," + d.getStockId() + "," + d.getPrice()
+                        + "," + d.getIsBuy() + "," + d.getQuantity() + "," + d.getTsMs();
                 return s.getBytes(StandardCharsets.UTF_8);
             }
         };
@@ -181,7 +96,14 @@ public class TopologyConfig {
             @Override public ExecutionRow deserialize(String topic, byte[] bytes) {
                 if (bytes == null) return null;
                 String[] p = new String(bytes, StandardCharsets.UTF_8).split(",");
-                return new ExecutionRow(p[0], p[1], Double.parseDouble(p[2]));
+                return new ExecutionRow(
+                        p[0],                         // userId
+                        p[1],                         // stockId
+                        Double.parseDouble(p[2]),     // price
+                        Integer.parseInt(p[3]),       // isBuy
+                        Long.parseLong(p[4]),         // quantity
+                        (p.length >= 6 ? Long.parseLong(p[5]) : System.currentTimeMillis()) // tsMs
+                );
             }
         };
         return Serdes.serdeFrom(ser, de);
