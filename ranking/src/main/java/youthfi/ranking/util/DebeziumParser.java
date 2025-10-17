@@ -30,7 +30,7 @@ public final class DebeziumParser {
             JsonNode after = payload.path("after");
             if (after.isMissingNode() || after.isNull()) return null;
 
-            // userId / stockId (snake/camel 모두 지원)
+            // userId / stockId
             String userId  = after.hasNonNull("user_id")  ? after.path("user_id").asText()
                     : after.hasNonNull("userId")  ? String.valueOf(after.path("userId").asLong())
                     : null;
@@ -46,37 +46,41 @@ public final class DebeziumParser {
                     : Long.parseLong(after.path("quantity").asText("0"));
             if (quantity <= 0) return null;
 
-            // price: 문자열/숫자 모두 처리
+            // price
             BigDecimal priceDec = after.path("price").isNumber()
                     ? after.path("price").decimalValue()
                     : new BigDecimal(after.path("price").asText("0"));
             double price = priceDec.doubleValue();
             if (price <= 0) return null;
 
-            // trade_at: µs(int64) 또는 문자열 → ms로 정규화
+            // trade_at: µs(int64) 또는 문자열 → ms
             if (after.has("trade_at")) {
                 JsonNode t = after.path("trade_at");
                 if (t.isNumber()) {
-                    long micros = t.asLong();     // e.g. 1760732159312309
-                    tsMs = micros / 1000L;        // µs → ms
+                    long micros = t.asLong();
+                    tsMs = micros / 1000L;
                 } else {
                     String s = t.asText();
                     try {
-                        // "2025-10-17 11:15:59[.n]" 같은 포맷 지원
                         LocalDateTime ldt = LocalDateTime.parse(s, DT_MICRO);
                         tsMs = ldt.toInstant(ZoneOffset.UTC).toEpochMilli();
-                    } catch (Exception ignore) {
-                        // 실패 시 payload.ts_ms 또는 현재시각 유지
-                    }
+                    } catch (Exception ignore) {}
                 }
             } else if (after.has("tradeAt")) {
                 tsMs = after.path("tradeAt").asLong(); // ms 가정
             }
 
-            return new ExecutionRow(userId, stockId, price, isBuy, quantity, tsMs);
+            // 새로 추가: user_balance_snapshot (nullable)
+            Double cashAfter = null;
+            if (after.has("user_balance_snapshot") && !after.get("user_balance_snapshot").isNull()) {
+                JsonNode n = after.get("user_balance_snapshot");
+                BigDecimal dec = n.isNumber() ? n.decimalValue() : new BigDecimal(n.asText("0"));
+                cashAfter = dec.doubleValue();
+            }
+
+            return new ExecutionRow(userId, stockId, price, isBuy, quantity, tsMs, cashAfter);
         } catch (Exception e) {
             return null;
         }
     }
-
 }
