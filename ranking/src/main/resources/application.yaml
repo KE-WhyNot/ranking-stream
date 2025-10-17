@@ -11,7 +11,7 @@ spring:
         username="${KAFKA_USERNAME}"
         password="${KAFKA_PASSWORD}";
     streams:
-      application-id: profit-ranking-app
+      application-id: profit-ranking-app-v2
       state-dir: /tmp/kafka-streams
       replication-factor: 1
       properties:
@@ -21,6 +21,5 @@ spring:
         processing.guarantee: exactly_once_v2
 
 topics:
-  userstock: finance.finance.userstock
   execution: finance.finance.execution
   out: notify.ranking.top10
