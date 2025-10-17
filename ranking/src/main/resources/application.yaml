@@ -11,7 +11,7 @@ spring:
         username="${KAFKA_USERNAME}"
         password="${KAFKA_PASSWORD}";
     streams:
-      application-id: profit-ranking-app-v2
+      application-id: profit-ranking-app-v3
       state-dir: /tmp/kafka-streams
       replication-factor: 1
       properties:

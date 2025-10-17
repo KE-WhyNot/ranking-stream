@@ -30,4 +30,7 @@ public class ExecutionRow {
     @JsonProperty("ts_ms")
     private long tsMs;
 
+    @JsonProperty("user_balance_snapshot")
+    private Double userBalanceSnapshot;
+
 }
