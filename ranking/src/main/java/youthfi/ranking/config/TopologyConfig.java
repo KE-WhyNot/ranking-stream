@@ -1,7 +1,6 @@
 package youthfi.ranking.config;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.apache.kafka.common.serialization.Serde;
 import org.apache.kafka.common.serialization.Serdes;
 import org.apache.kafka.common.utils.Bytes;
 import org.apache.kafka.streams.StreamsBuilder;
@@ -12,11 +11,10 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import youthfi.ranking.model.ExecutionRow;
 import youthfi.ranking.model.RankItem;
-import youthfi.ranking.transformer.RealizedRateFifoTransformer;
+import youthfi.ranking.transformer.BaselineRateTransformer;
 import youthfi.ranking.transformer.TopNTransformer;
 import youthfi.ranking.util.DebeziumParser;
 
-import java.nio.charset.StandardCharsets;
 import java.util.List;
 
 @Configuration
@@ -30,47 +28,49 @@ public class TopologyConfig {
     @Bean
     public KStream<String, String> kStream(StreamsBuilder builder) {
 
-        // 0) execution 파싱 (키 = userId|stockId)
+        // 1) execution 파싱
         KStream<String, ExecutionRow> execStream = builder
                 .stream(executionTopic, Consumed.with(Serdes.String(), Serdes.String()))
                 .mapValues(DebeziumParser::parseExecution)
-                .filter((k,v) -> v != null)
-                .selectKey((k,v) -> v.getUserId() + "|" + v.getStockId());
+                .filter((k,v) -> v != null);
 
-        // 1) BUY 롯 상태 스토어 (키=userId|stockId, 값=Deque<BuyLot> 직렬화 바이트)
-        var lotsStoreBuilder = Stores.keyValueStoreBuilder(
-                Stores.persistentKeyValueStore("buy-lots"),
-                Serdes.String(), Serdes.ByteArray());
-        builder.addStateStore(lotsStoreBuilder);
+        // 2) userId로 rekey (같은 유저 이벤트 순서 보장)
+        KStream<String, ExecutionRow> byUser = execStream
+                .selectKey((k,v) -> v.getUserId());
 
-        // 2) FIFO 처리 → SELL 시 실현 수익률(Double) 방출
-        KStream<String, Double> realizedRatePerTrade =
-                execStream.transformValues(
-                        () -> new RealizedRateFifoTransformer("buy-lots"),
-                        "buy-lots"
-                ).filter((k,v) -> v != null);
+        // 3) baseline 상태 스토어 (userId -> baseline cash)
+        var baselineStore = Stores.keyValueStoreBuilder(
+                Stores.persistentKeyValueStore("baseline-cash-store"),
+                Serdes.String(), Serdes.Double()
+        );
+        builder.addStateStore(baselineStore);
 
-        // 3) 유저별 최신 실현 수익률 유지
-        KTable<String, Double> userLatestRate = realizedRatePerTrade
-                .selectKey((userStockKey, rate) -> userStockKey.split("\\|", 2)[0]) // userId
+        // 4) 매도 시점의 수익률 계산
+        KStream<String, Double> userRate = byUser
+                .transformValues(() -> new BaselineRateTransformer("baseline-cash-store"),
+                        "baseline-cash-store")
+                .filter((userId, rate) -> rate != null);
+
+        // 5) 유저별 최신 수익률 유지
+        KTable<String, Double> latestUserRate = userRate
                 .groupByKey(Grouped.with(Serdes.String(), Serdes.Double()))
                 .reduce((oldV, newV) -> newV,
-                        Materialized.<String, Double, KeyValueStore<Bytes, byte[]>>as("user-latest-realized-rate")
+                        Materialized.<String, Double, KeyValueStore<Bytes, byte[]>>as("user-latest-rate")
                                 .withKeySerde(Serdes.String())
                                 .withValueSerde(Serdes.Double())
                 );
 
-        // 4) Top10 계산 (StateStore)
+        // 6) Top10 계산 (StateStore)
         var topStoreBuilder = Stores.keyValueStoreBuilder(
                 Stores.persistentKeyValueStore("top10-store"),
                 Serdes.String(), Serdes.Double());
         builder.addStateStore(topStoreBuilder);
 
-        KStream<String, List<RankItem>> top10 = userLatestRate
+        KStream<String, List<RankItem>> top10 = latestUserRate
                 .toStream()
                 .transformValues(() -> new TopNTransformer("top10-store"), "top10-store");
 
-        // 5) JSON 직렬화 후 발행
+        // 7) JSON 직렬화 후 발행
         top10
                 .mapValues(list -> {
                     try { return M.writeValueAsString(list); }
@@ -79,33 +79,7 @@ public class TopologyConfig {
                 .selectKey((k,v) -> "TOP10")
                 .to(outTopic, Produced.with(Serdes.String(), Serdes.String()));
 
+        // optional: 디버깅용 리턴
         return builder.stream(outTopic, Consumed.with(Serdes.String(), Serdes.String()));
-    }
-
-    // ---- Serde: ExecutionRow ----
-    private Serde<ExecutionRow> executionSerde() {
-        var ser = new org.apache.kafka.common.serialization.Serializer<ExecutionRow>() {
-            @Override public byte[] serialize(String topic, ExecutionRow d) {
-                if (d == null) return null;
-                String s = d.getUserId() + "," + d.getStockId() + "," + d.getPrice()
-                        + "," + d.getIsBuy() + "," + d.getQuantity() + "," + d.getTsMs();
-                return s.getBytes(StandardCharsets.UTF_8);
-            }
-        };
-        var de = new org.apache.kafka.common.serialization.Deserializer<ExecutionRow>() {
-            @Override public ExecutionRow deserialize(String topic, byte[] bytes) {
-                if (bytes == null) return null;
-                String[] p = new String(bytes, StandardCharsets.UTF_8).split(",");
-                return new ExecutionRow(
-                        p[0],                         // userId
-                        p[1],                         // stockId
-                        Double.parseDouble(p[2]),     // price
-                        Integer.parseInt(p[3]),       // isBuy
-                        Long.parseLong(p[4]),         // quantity
-                        (p.length >= 6 ? Long.parseLong(p[5]) : System.currentTimeMillis()) // tsMs
-                );
-            }
-        };
-        return Serdes.serdeFrom(ser, de);
     }
 }
