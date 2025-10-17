@@ -20,4 +20,14 @@ public class ExecutionRow {
 
     @JsonProperty("price")
     private double price;
+
+    @JsonProperty("is_buy")
+    private int isBuy;
+
+    @JsonProperty("quantity")
+    private long quantity;
+
+    @JsonProperty("ts_ms")
+    private long tsMs;
+
 }
