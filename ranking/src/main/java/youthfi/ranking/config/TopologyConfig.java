@@ -37,15 +37,24 @@ public class TopologyConfig {
                 .filter((k,v) -> v != null)
                 .selectKey((k,v) -> v.getUserId() + "|" + v.getStockId());
 
-        // 1) BUY 롯 상태 스토어 (키=userId|stockId, 값=Deque<BuyLot> 직렬화 바이트)
+        // ★ 3파티션 강제
+        KStream<String, ExecutionRow> execP3 = execStream.repartition(
+                Repartitioned.<String, ExecutionRow>as("exec-p3")
+                        .withNumberOfPartitions(3)
+                        .withKeySerde(Serdes.String())
+                        .withValueSerde(executionSerde())
+        );
+
+        // 1) BUY 롯 상태 스토어
         var lotsStoreBuilder = Stores.keyValueStoreBuilder(
                 Stores.persistentKeyValueStore("buy-lots"),
                 Serdes.String(), Serdes.ByteArray());
         builder.addStateStore(lotsStoreBuilder);
 
         // 2) FIFO 처리 → SELL 시 실현 수익률(Double) 방출
+        //    ★ execP3 사용
         KStream<String, Double> realizedRatePerTrade =
-                execStream.transformValues(
+                execP3.transformValues(
                         () -> new RealizedRateFifoTransformer("buy-lots"),
                         "buy-lots"
                 ).filter((k,v) -> v != null);
@@ -60,14 +69,22 @@ public class TopologyConfig {
                                 .withValueSerde(Serdes.Double())
                 );
 
+        // ★ top10 앞단 3파티션 보장
+        KStream<String, Double> ratesP3 = userLatestRate.toStream().repartition(
+                Repartitioned.<String, Double>as("rates-p3")
+                        .withNumberOfPartitions(3)
+                        .withKeySerde(Serdes.String())
+                        .withValueSerde(Serdes.Double())
+        );
+
         // 4) Top10 계산 (StateStore)
         var topStoreBuilder = Stores.keyValueStoreBuilder(
                 Stores.persistentKeyValueStore("top10-store"),
                 Serdes.String(), Serdes.Double());
         builder.addStateStore(topStoreBuilder);
 
-        KStream<String, List<RankItem>> top10 = userLatestRate
-                .toStream()
+        // ★ ratesP3 사용
+        KStream<String, List<RankItem>> top10 = ratesP3
                 .transformValues(() -> new TopNTransformer("top10-store"), "top10-store");
 
         // 5) JSON 직렬화 후 발행
